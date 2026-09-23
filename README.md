@@ -54,7 +54,7 @@ Create the worker in the Proseth platform first — that is what issues the
 token, and it is shown only once.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/OWNER/proseth-worker/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/prosethsolutionsAI/proseth-worker/main/install.sh
 sudo bash install.sh
 ```
 
