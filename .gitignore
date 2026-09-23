@@ -1,0 +1,17 @@
+﻿# Nothing generated, and nothing from a deployment, belongs in this repository.
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Never. These are what a worker is given at install time, per site.
+worker.env
+*.token
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+inventory*.ini
+kubeconfig*
+*.tfstate
+*.tfstate.*
