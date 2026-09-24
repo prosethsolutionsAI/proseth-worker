@@ -46,7 +46,7 @@ from .jobs import EXECUTOR, HANDLERS
 #
 # Bump it whenever the agent or the installer changes in a way an existing
 # worker should pick up. `sudo proseth-worker-update` is how a worker gets it.
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 CONFIG_PATH = Path(os.environ.get("PROSETH_WORKER_CONFIG",
                                   "/etc/proseth-worker/config.json"))
@@ -135,13 +135,28 @@ class Agent:
     async def session(self) -> None:
         import websockets  # noqa: PLC0415
 
+        # A `wss://` URI needs an SSL context, ALWAYS.
+        #
+        # This used to build one only when verification was being turned OFF,
+        # which meant the ordinary, verifying TLS path passed `ssl=None` to a
+        # `wss://` URI - and websockets refuses that outright:
+        #
+        #   ssl=None is incompatible with a wss:// URI
+        #
+        # The installer writes `verify_tls: true`, so that was the path every
+        # normal install took: answering yes to TLS produced an agent that
+        # could never connect and retried for ever with a message about a
+        # keyword argument. The only combination that worked was the insecure
+        # one. Verification is a property OF the context, not a reason to have
+        # one.
         ssl_context = None
-        if self.tls and not self.verify_tls:
+        if self.tls:
             import ssl  # noqa: PLC0415
 
             ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
+            if not self.verify_tls:
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
 
         log.info("Connecting to %s", self.url)
         async with websockets.connect(

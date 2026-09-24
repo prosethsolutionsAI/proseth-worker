@@ -81,7 +81,7 @@ The installer asks four things:
 |---|---|
 | The Supervisor's address | It may be a private address across a tunnel or a public one. Only you know which this machine can reach. |
 | The port | Defaults to 9998. |
-| Whether to use TLS | `wss://` instead of `ws://`. Off by default; see [Security notes](#security-notes). |
+| Whether to use TLS | `wss://` instead of `ws://`. **Answer no unless you have put TLS in front of your Supervisor yourself** — it serves plain `ws` by default, and the installer will turn TLS back off if it finds that to be the case. Asked every time rather than remembered, so a wrong answer does not persist. |
 | The worker name and token | Issued when the worker was created in the platform. The name should match what you called it there. |
 
 It then checks it can actually reach the Supervisor **before** changing
@@ -152,6 +152,7 @@ with no internet at all.
 
 | Version | What changed |
 |---|---|
+| 1.1.1 | **TLS now works at all.** A `wss://` connection was built with no SSL context whenever certificate verification was left on — which is the default — so the agent retried for ever with `ssl=None is incompatible with a wss:// URI`. Only the insecure variant had ever worked. TLS also now defaults to **off** at the prompt and is asked rather than inherited, and the installer checks what actually answered on the port: it confirms it reached a Proseth Supervisor, and turns TLS off by itself if the Supervisor is serving plain HTTP. |
 | 1.1.0 | Installing from `install.sh` alone now works — it fetches the agent rather than failing. A failed install stops and says so instead of reporting success. `proseth-worker-setup` no longer destroys the agent it is re-configuring. An unattended re-run keeps the TLS setting. Added `proseth-worker-update`. |
 | 1.0.0 | First release. |
 
@@ -227,8 +228,9 @@ but the standard library. If you change it, change both.
 * Secrets are never passed as command-line arguments — they would be visible in
   the process list to anything else on the machine.
 * The connection is a plain WebSocket unless you answer yes to TLS at install
-  time. **Run it across a network you trust, or a tunnel.** Saying so is better
-  than implying the default is encrypted.
+  time **and** have terminated TLS in front of the Supervisor yourself — it
+  does not serve TLS on its own. **Run it across a network you trust, or a
+  tunnel.** Saying so is better than implying the default is encrypted.
 
 ---
 

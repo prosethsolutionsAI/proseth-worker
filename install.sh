@@ -173,17 +173,26 @@ ask "Supervisor IP or hostname" "$EXISTING_HOST" SUP_HOST
 ask "Port" "${EXISTING_PORT:-$DEFAULT_PORT}" SUP_PORT
 case "$SUP_PORT" in (''|*[!0-9]*) die "'$SUP_PORT' is not a port number." ;; esac
 
+# TLS defaults to OFF, and the prompt says so every time - it is NOT inherited
+# from an existing configuration the way the other answers are.
+#
+# That is deliberate and it is the one place this installer breaks its own
+# "press Enter to keep each value" rule. The Supervisor does not serve TLS yet
+# (it is the first item on its roadmap), so `yes` is an answer that cannot
+# work today - and a worker that answered yes once would otherwise keep being
+# offered yes as the default for ever, quietly re-arming the trap on every
+# re-run. An engineer who genuinely has TLS in front of their Supervisor types
+# `y`, which is one keystroke, and the probe above confirms it.
+# Changing something the engineer set before is worth saying out loud, even
+# when the previous value was one that could not work.
+if [ "$EXISTING_TLS" = "true" ]; then
+  warn "this worker had TLS on; it is being asked again rather than kept"
+fi
 if [ -n "$NONINTERACTIVE" ]; then
-  USE_TLS="${PROSETH_TLS:-${EXISTING_TLS:-false}}"
+  USE_TLS="${PROSETH_TLS:-false}"
 else
-  if [ "$EXISTING_TLS" = "true" ]; then
-    printf "  Use TLS (wss)? ${DIM}[Y/n]${OFF}: "
-    read -r USE_TLS
-    USE_TLS="${USE_TLS:-y}"
-  else
-    printf "  Use TLS (wss)? ${DIM}[y/N]${OFF}: "
-    read -r USE_TLS
-  fi
+  printf "  Use TLS (wss)? ${DIM}[y/N]${OFF} ${DIM}(the Supervisor serves plain ws today)${OFF}: "
+  read -r USE_TLS
 fi
 case "${USE_TLS,,}" in y|yes|true) USE_TLS=true ;; *) USE_TLS=false ;; esac
 
@@ -208,6 +217,53 @@ say "Checking this machine can reach $SUP_HOST:$SUP_PORT"
 if command -v timeout >/dev/null 2>&1 && \
    timeout 8 bash -c "exec 3<>/dev/tcp/$SUP_HOST/$SUP_PORT" 2>/dev/null; then
   ok "the port answered"
+
+  # An open port is NOT proof that the Supervisor is behind it - a firewall
+  # answering on the same port looks identical to `/dev/tcp`, and so does a
+  # DNAT rule pointing somewhere else. Ask the thing that answered who it is.
+  #
+  # It also catches the mistake that cost a real install an afternoon:
+  # answering yes to TLS when the Supervisor is serving plain HTTP. That used
+  # to produce an agent retrying `wss://` for ever, and the reason was buried
+  # in a journal on a machine nobody was looking at.
+  if command -v curl >/dev/null 2>&1; then
+    PROBE_SCHEME="http"; [ "$USE_TLS" = "true" ] && PROBE_SCHEME="https"
+    HEALTH="$(curl -fsS --max-time 8 -k \
+              "$PROBE_SCHEME://$SUP_HOST:$SUP_PORT/api/health" 2>/dev/null || true)"
+    case "$HEALTH" in
+      *proseth-engineer-system*)
+        ok "it is a Proseth Supervisor, over ${PROBE_SCHEME}" ;;
+      *)
+        # Try the other scheme before complaining - that difference IS the
+        # diagnosis, and reporting "unreachable" when the answer is "you
+        # picked the wrong scheme" would send somebody to the firewall.
+        OTHER="http"; [ "$PROBE_SCHEME" = "http" ] && OTHER="https"
+        OTHER_HEALTH="$(curl -fsS --max-time 8 -k \
+                        "$OTHER://$SUP_HOST:$SUP_PORT/api/health" 2>/dev/null || true)"
+        case "$OTHER_HEALTH" in
+          *proseth-engineer-system*)
+            if [ "$USE_TLS" = "true" ]; then
+              warn "the Supervisor is serving PLAIN HTTP on this port, not TLS"
+              echo ""
+              echo "    You answered yes to TLS, so the agent would try wss:// and"
+              echo "    never connect. Turning TLS off for this worker."
+              echo ""
+              USE_TLS=false
+            else
+              warn "the Supervisor appears to be serving TLS on this port"
+              echo ""
+              echo "    Re-run and answer yes to TLS, or the agent will not connect."
+              echo ""
+            fi ;;
+          *)
+            warn "something answered on $SUP_PORT, but it is not a Proseth Supervisor"
+            echo ""
+            echo "    A firewall or a NAT rule pointing elsewhere answers exactly"
+            echo "    like this. Check the port-forward reaches the Supervisor."
+            echo "" ;;
+        esac ;;
+    esac
+  fi
 else
   warn "could not open $SUP_HOST:$SUP_PORT from here"
   echo ""
