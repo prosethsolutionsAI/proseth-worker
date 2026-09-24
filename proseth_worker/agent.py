@@ -39,7 +39,14 @@ from pathlib import Path
 from . import facts, protocol
 from .jobs import EXECUTOR, HANDLERS
 
-VERSION = "1.0.0"
+# The agent's version, and the ONE place it is written down. The installer
+# reads it straight out of this file with sed, it goes up in the HELLO frame,
+# and the Supervisor shows it on the Workers page - so "what is that site
+# actually running" is answerable without logging into the box.
+#
+# Bump it whenever the agent or the installer changes in a way an existing
+# worker should pick up. `sudo proseth-worker-update` is how a worker gets it.
+VERSION = "1.1.0"
 
 CONFIG_PATH = Path(os.environ.get("PROSETH_WORKER_CONFIG",
                                   "/etc/proseth-worker/config.json"))

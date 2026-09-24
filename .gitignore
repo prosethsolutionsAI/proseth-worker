@@ -1,10 +1,17 @@
-﻿# Nothing generated, and nothing from a deployment, belongs in this repository.
+# Nothing generated, and nothing from a deployment, belongs in this repository.
 __pycache__/
 *.py[cod]
 venv/
 .venv/
 
 # Never. These are what a worker is given at install time, per site.
+#
+# config.json is THE one that matters: it holds this worker's token, which is
+# full access to the Supervisor for that site. It replaced worker.env, and the
+# old name sat here on its own for a while - so the file that actually carries
+# the credential was the one not being ignored. Both are listed now: the dead
+# name costs nothing and an old box may still have one.
+config.json
 worker.env
 *.token
 *.pem

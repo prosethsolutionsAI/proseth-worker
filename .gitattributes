@@ -1,3 +1,6 @@
+# A shell script checked out with CRLF dies on Linux with
+# "bad interpreter: /usr/bin/env bash^M", which says nothing about the cause.
+# This repository is authored on Windows, so pin it rather than hope.
 * text=auto eol=lf
 *.sh text eol=lf
 *.py text eol=lf
