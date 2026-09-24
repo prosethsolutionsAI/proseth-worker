@@ -155,6 +155,7 @@ with no internet at all.
 
 | Version | What changed |
 |---|---|
+| 1.1.5 | `proseth-worker --check` works from any directory. The launcher did not set `PYTHONPATH` — only the systemd unit did — so the service ran fine while the command the installer prints and this file documents failed with `No module named 'proseth_worker'` for anyone not standing in `/opt`. |
 | 1.1.4 | **One-click upgrade from the Supervisor.** A worker showing an available update can be upgraded from its card rather than by finding a shell on it. The agent is granted exactly one command through sudo — a root-owned wrapper taking no arguments — which starts the ordinary installer in a separate systemd unit so restarting the service cannot kill the update half way through. The worker still fetches the release itself; nothing is pushed to it. |
 | 1.1.3 | The agent can be given the Supervisor's certificate (`ca_cert`), so TLS can be verified rather than merely encrypted. The installer fetches it, stores it beside the config and prints its fingerprint, and it now turns TLS **on** by itself if the port is using it — the correction already worked in the other direction. |
 | 1.1.2 | Quieter install: the TLS prompt no longer comments on the Supervisor, and the reachability check reports only whether it reached it. |

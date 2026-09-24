@@ -556,8 +556,17 @@ chmod 640 "$CONFIG"
 ok "configuration written to $CONFIG"
 
 # --- launcher and service --------------------------------------------------
+# PYTHONPATH is set HERE as well as in the systemd unit.
+#
+# Without it `proseth-worker --check` dies with
+# "No module named 'proseth_worker'" for anyone whose shell is not sitting in
+# /opt - which is everyone. The service worked, because the unit sets
+# PYTHONPATH itself, so the breakage was invisible until somebody ran the
+# command the installer prints and the README documents. Found on a live box.
 cat > /usr/local/bin/proseth-worker <<LAUNCH
 #!/bin/sh
+PYTHONPATH="$PREFIX\${PYTHONPATH:+:\$PYTHONPATH}"
+export PYTHONPATH
 exec $PREFIX/venv/bin/python -m proseth_worker.agent "\$@"
 LAUNCH
 chmod 755 /usr/local/bin/proseth-worker

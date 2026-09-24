@@ -46,7 +46,7 @@ from .jobs import EXECUTOR, HANDLERS
 #
 # Bump it whenever the agent or the installer changes in a way an existing
 # worker should pick up. `sudo proseth-worker-update` is how a worker gets it.
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 
 CONFIG_PATH = Path(os.environ.get("PROSETH_WORKER_CONFIG",
                                   "/etc/proseth-worker/config.json"))
