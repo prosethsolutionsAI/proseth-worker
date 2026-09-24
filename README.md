@@ -152,6 +152,7 @@ with no internet at all.
 
 | Version | What changed |
 |---|---|
+| 1.1.3 | The agent can be given the Supervisor's certificate (`ca_cert`), so TLS can be verified rather than merely encrypted. The installer fetches it, stores it beside the config and prints its fingerprint, and it now turns TLS **on** by itself if the port is using it — the correction already worked in the other direction. |
 | 1.1.2 | Quieter install: the TLS prompt no longer comments on the Supervisor, and the reachability check reports only whether it reached it. |
 | 1.1.1 | **TLS now works at all.** A `wss://` connection was built with no SSL context whenever certificate verification was left on — which is the default — so the agent retried for ever with `ssl=None is incompatible with a wss:// URI`. Only the insecure variant had ever worked. TLS also now defaults to **off** at the prompt and is asked rather than inherited, and the installer checks what actually answered on the port: it confirms it reached the Supervisor, and corrects the TLS setting if it does not match what is available there. |
 | 1.1.0 | Installing from `install.sh` alone now works — it fetches the agent rather than failing. A failed install stops and says so instead of reporting success. `proseth-worker-setup` no longer destroys the agent it is re-configuring. An unattended re-run keeps the TLS setting. Added `proseth-worker-update`. |
@@ -171,6 +172,7 @@ sudo systemctl restart proseth-worker  # after changing the configuration
 |---|---|
 | `/opt/proseth-worker` | The agent's own code, its Python venv, and a copy of the installer. Root-owned; the service cannot write to it. |
 | `/etc/proseth-worker/config.json` | Supervisor address, port, TLS, worker name, token. Mode `640`, readable by root and the `proseth` service account only. |
+| `/etc/proseth-worker/supervisor.crt` | The Supervisor's certificate, when TLS is in use — this is what the agent verifies against. Public; mode `644`. |
 | `/var/lib/proseth-worker` | Everything the agent writes: Ansible temp, Terraform working directories, SSH known hosts. This is also the service account's `$HOME` — Ansible refuses to start without a writable one. |
 
 | Command | What it does |
@@ -228,10 +230,17 @@ but the standard library. If you change it, change both.
   with the files at 0600, and are removed by a shell `trap` on every exit path.
 * Secrets are never passed as command-line arguments — they would be visible in
   the process list to anything else on the machine.
-* The connection is a plain WebSocket unless you answer yes to TLS at install
-  time **and** have terminated TLS in front of the Supervisor yourself — it
-  does not serve TLS on its own. **Run it across a network you trust, or a
-  tunnel.** Saying so is better than implying the default is encrypted.
+* **The connection is a plain WebSocket unless TLS is enabled at both ends.**
+  Where the Supervisor offers TLS, the installer detects it, turns it on, and
+  fetches the certificate the agent then verifies against — so `wss://` here is
+  encrypted *and* authenticated, not merely encrypted. Where it does not, the
+  traffic is in clear: **run it across a network you trust, or a tunnel.**
+  Saying so is better than implying the default is encrypted.
+* The certificate is fetched from the Supervisor at install time, which is
+  trust-on-first-use — an interception at that moment could substitute its
+  own. The installer prints the fingerprint; compare it against the
+  Supervisor's if the path between them is not trusted, or copy the file
+  across by hand instead.
 
 ---
 

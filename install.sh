@@ -256,8 +256,11 @@ if command -v timeout >/dev/null 2>&1 && \
               warn "TLS is not available on $SUP_HOST:$SUP_PORT - continuing without it"
               USE_TLS=false
             else
-              warn "$SUP_HOST:$SUP_PORT expects TLS - re-run and answer y to 'Use TLS'"
-              echo ""
+              # Corrected in this direction too, rather than telling somebody
+              # to run the whole installer again over a yes/no answer the
+              # machine has just worked out for itself.
+              warn "$SUP_HOST:$SUP_PORT uses TLS - turning it on for this worker"
+              USE_TLS=true
             fi ;;
           *)
             warn "something answered on $SUP_PORT, but it is not a Proseth Supervisor"
@@ -497,6 +500,44 @@ ok "agent $AGENT_VERSION and its dependencies"
 
 # --- configuration ---------------------------------------------------------
 install -d -m 750 -o root -g "$RUN_USER" "$CONFIG_DIR"
+
+# The Supervisor's certificate, when TLS is on.
+#
+# It is self-signed, so it is not in this machine's trust store and cannot be
+# verified against it. Being handed a copy is what makes `verify_tls: true`
+# mean anything - the alternative is turning verification off, which encrypts
+# the traffic and authenticates nobody.
+#
+# Fetched over the connection we are about to trust, which is
+# trust-on-first-use: an interception AT THIS MOMENT could substitute its own.
+# The fingerprint is printed so it can be compared against the Supervisor's,
+# which is the check that closes that gap for anyone who needs it closed.
+CA_LINE=""
+if [ "$USE_TLS" = "true" ]; then
+  CA_PATH="$CONFIG_DIR/supervisor.crt"
+  if curl -fsS --max-time 15 -k -o "$CA_PATH.new" \
+       "https://$SUP_HOST:$SUP_PORT/api/workers/ca-certificate" 2>/dev/null \
+     && grep -q "BEGIN CERTIFICATE" "$CA_PATH.new" 2>/dev/null; then
+    mv "$CA_PATH.new" "$CA_PATH"
+    chmod 644 "$CA_PATH"
+    CA_LINE="  \"ca_cert\": \"$CA_PATH\","
+    ok "Supervisor certificate stored at $CA_PATH"
+    if command -v openssl >/dev/null 2>&1; then
+      echo "         $(openssl x509 -noout -fingerprint -sha256 -in "$CA_PATH" 2>/dev/null \
+                      | sed 's/^.*=//')"
+      echo "${DIM}         compare that with the Supervisor's if this network is not trusted${OFF}"
+    fi
+  else
+    rm -f "$CA_PATH.new"
+    warn "could not fetch the Supervisor's certificate"
+    echo ""
+    echo "    Without it the agent cannot verify a self-signed certificate and"
+    echo "    will not connect. Copy it to $CA_PATH by hand,"
+    echo "    then re-run: sudo proseth-worker-setup"
+    echo ""
+  fi
+fi
+
 cat > "$CONFIG" <<JSON
 {
   "worker_name": "$WORKER_NAME",
@@ -504,6 +545,7 @@ cat > "$CONFIG" <<JSON
   "supervisor_port": $SUP_PORT,
   "tls": $USE_TLS,
   "verify_tls": true,
+$CA_LINE
   "token": "$WORKER_TOKEN"
 }
 JSON

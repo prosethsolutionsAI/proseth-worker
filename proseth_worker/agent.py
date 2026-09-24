@@ -46,7 +46,7 @@ from .jobs import EXECUTOR, HANDLERS
 #
 # Bump it whenever the agent or the installer changes in a way an existing
 # worker should pick up. `sudo proseth-worker-update` is how a worker gets it.
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 
 CONFIG_PATH = Path(os.environ.get("PROSETH_WORKER_CONFIG",
                                   "/etc/proseth-worker/config.json"))
@@ -82,6 +82,12 @@ class Agent:
         self.name = str(config.get("worker_name") or "").strip()
         self.tls = bool(config.get("tls"))
         self.verify_tls = bool(config.get("verify_tls", True))
+        # The Supervisor's certificate is self-signed, so it is not in this
+        # machine's trust store and never will be. Being given a copy is what
+        # lets verification actually mean something here - without it the only
+        # way to use TLS at all is to turn verification off, which encrypts the
+        # traffic and authenticates nobody.
+        self.ca_cert = str(config.get("ca_cert") or "").strip()
         self.websocket = None
         self.stopping = asyncio.Event()
         # job id -> cancelled flag, so a handler can notice between steps.
@@ -154,6 +160,18 @@ class Agent:
             import ssl  # noqa: PLC0415
 
             ssl_context = ssl.create_default_context()
+            if self.ca_cert:
+                # Trust THIS Supervisor's certificate and nothing else about
+                # it. A self-signed certificate is not in the system store, so
+                # without this the handshake fails with a bare
+                # "certificate verify failed: self-signed certificate".
+                try:
+                    ssl_context.load_verify_locations(cafile=self.ca_cert)
+                except OSError as exc:
+                    log.error("Could not read the Supervisor certificate at "
+                              "%s: %s", self.ca_cert, exc)
+                    log.error("Run: sudo proseth-worker-setup")
+                    raise SystemExit(78) from exc
             if not self.verify_tls:
                 ssl_context.check_hostname = False
                 ssl_context.verify_mode = ssl.CERT_NONE
