@@ -46,7 +46,7 @@ from .jobs import EXECUTOR, HANDLERS
 #
 # Bump it whenever the agent or the installer changes in a way an existing
 # worker should pick up. `sudo proseth-worker-update` is how a worker gets it.
-VERSION = "1.1.5"
+VERSION = "1.1.6"
 
 CONFIG_PATH = Path(os.environ.get("PROSETH_WORKER_CONFIG",
                                   "/etc/proseth-worker/config.json"))
@@ -60,17 +60,42 @@ BACKOFF_START = 2
 BACKOFF_MAX = 60
 
 
-def load_config() -> dict:
+def read_config() -> tuple[dict | None, str]:
+    """The config, or a plain sentence saying why not.
+
+    Split out from `load_config` so `--check` can report a problem WITHOUT the
+    service's error logging and without exiting. The two callers want opposite
+    things from the same failure: the service must log loudly and stop; the
+    check is a human asking a question and should answer it.
+
+    The distinction that matters is missing vs unreadable. The config is mode
+    0640 root:proseth, so an ordinary user running `proseth-worker --check` -
+    which the installer prints and the README documents - gets a permission
+    error, and the old code reported that as "not set up yet", sending people
+    to re-run the installer over a file that was perfectly fine.
+    """
     try:
         with open(CONFIG_PATH, encoding="utf-8") as handle:
-            return json.load(handle)
+            return json.load(handle), ""
     except FileNotFoundError:
-        log.error("No configuration at %s. Run the installer:", CONFIG_PATH)
-        log.error("  sudo proseth-worker-setup")
+        return None, (f"no configuration at {CONFIG_PATH} - "
+                      "run `sudo proseth-worker-setup`")
+    except PermissionError:
+        return None, (f"{CONFIG_PATH} is readable by root and the service "
+                      "account only - run this with sudo to see it")
+    except OSError as exc:
+        return None, f"could not read {CONFIG_PATH}: {exc}"
+    except ValueError as exc:
+        return None, (f"{CONFIG_PATH} is not valid JSON ({exc}) - "
+                      "run `sudo proseth-worker-setup`")
+
+
+def load_config() -> dict:
+    config, problem = read_config()
+    if config is None:
+        log.error("%s", problem[:1].upper() + problem[1:])
         raise SystemExit(78)
-    except (OSError, ValueError) as exc:
-        log.error("Could not read %s: %s", CONFIG_PATH, exc)
-        raise SystemExit(78) from exc
+    return config
 
 
 class Agent:
@@ -428,15 +453,16 @@ def main() -> int:
               f"memory: {info.get('memory_total_mb')} MB   "
               f"disk free: {info.get('disk_free_gb')} GB")
         print(f"  tools   : {', '.join(info.get('tools') or []) or 'none found'}")
-        try:
-            config = load_config()
+        config, problem = read_config()
+        if config is None:
+            print(f"  config  : {problem}")
+        else:
             print(f"  config  : {CONFIG_PATH}")
             print(f"  worker  : {config.get('worker_name')}")
             print(f"  connects: {config.get('supervisor_host')}:"
-                  f"{config.get('supervisor_port')}")
+                  f"{config.get('supervisor_port')}"
+                  + ("  (TLS)" if config.get("tls") else ""))
             print(f"  token   : {'set' if config.get('token') else 'MISSING'}")
-        except SystemExit:
-            print("  config  : not set up yet - run `sudo proseth-worker-setup`")
         return 0
 
     agent = Agent(load_config())
