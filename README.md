@@ -123,6 +123,9 @@ without logging into any of them.
 
 ### Updating an existing worker
 
+From the Supervisor, press **Upgrade** on the worker's card — it appears
+whenever that worker is behind. Or on the box:
+
 ```bash
 sudo proseth-worker-update
 ```
@@ -152,6 +155,7 @@ with no internet at all.
 
 | Version | What changed |
 |---|---|
+| 1.1.4 | **One-click upgrade from the Supervisor.** A worker showing an available update can be upgraded from its card rather than by finding a shell on it. The agent is granted exactly one command through sudo — a root-owned wrapper taking no arguments — which starts the ordinary installer in a separate systemd unit so restarting the service cannot kill the update half way through. The worker still fetches the release itself; nothing is pushed to it. |
 | 1.1.3 | The agent can be given the Supervisor's certificate (`ca_cert`), so TLS can be verified rather than merely encrypted. The installer fetches it, stores it beside the config and prints its fingerprint, and it now turns TLS **on** by itself if the port is using it — the correction already worked in the other direction. |
 | 1.1.2 | Quieter install: the TLS prompt no longer comments on the Supervisor, and the reachability check reports only whether it reached it. |
 | 1.1.1 | **TLS now works at all.** A `wss://` connection was built with no SSL context whenever certificate verification was left on — which is the default — so the agent retried for ever with `ssl=None is incompatible with a wss:// URI`. Only the insecure variant had ever worked. TLS also now defaults to **off** at the prompt and is asked rather than inherited, and the installer checks what actually answered on the port: it confirms it reached the Supervisor, and corrects the TLS setting if it does not match what is available there. |
@@ -222,7 +226,14 @@ but the standard library. If you change it, change both.
 
 ## Security notes
 
-* The service account has **no sudo** and cannot write to `/opt/proseth-worker`.
+* The service account cannot write to `/opt/proseth-worker`, so the agent
+  cannot rewrite its own code.
+* It is granted **exactly one command** through sudo, in
+  `/etc/sudoers.d/proseth-worker`: `proseth-worker-selfupdate`, root-owned, in
+  a directory the account cannot write to, and taking **no arguments** — so
+  there is nothing to smuggle through it. It is what makes Upgrade work from
+  the Supervisor, and it grants nothing else. Remove that file if you would
+  rather upgrade only from the box; everything else keeps working.
 * The token is stored in `/etc/proseth-worker/config.json`, mode `640`,
   root-owned and readable by the service account. The Supervisor keeps only a
   bcrypt hash of it and cannot read it back.

@@ -79,6 +79,16 @@ RELOAD = "reload"
 # purpose. It exits cleanly and systemd's `Restart=` brings it back - which
 # also means a restart works identically however the agent was started.
 RESTART = "restart"
+# Ask the agent to upgrade ITSELF to the current release and come back.
+#
+# The agent cannot do this in its own process: the code lives in /opt, which is
+# root-owned precisely so the service account cannot rewrite its own agent. So
+# it runs one root-owned wrapper through a single narrow sudoers rule, and that
+# wrapper launches the real installer as a SEPARATE transient systemd unit -
+# outside the agent's own cgroup, because the installer restarts
+# proseth-worker at the end and would otherwise kill the update half way
+# through by killing the process that started it.
+UPGRADE = "upgrade"
 DENIED = "denied"
 
 # --- job kinds -------------------------------------------------------------

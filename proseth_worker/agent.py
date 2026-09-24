@@ -1,4 +1,4 @@
-"""The Proseth Worker agent.
+﻿"""The Proseth Worker agent.
 
 Runs as a systemd service on an Ubuntu box inside a customer's network. It dials
 out to the Supervisor, keeps one WebSocket open, and carries out the jobs it is
@@ -46,7 +46,7 @@ from .jobs import EXECUTOR, HANDLERS
 #
 # Bump it whenever the agent or the installer changes in a way an existing
 # worker should pick up. `sudo proseth-worker-update` is how a worker gets it.
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 
 CONFIG_PATH = Path(os.environ.get("PROSETH_WORKER_CONFIG",
                                   "/etc/proseth-worker/config.json"))
@@ -263,8 +263,67 @@ class Agent:
             # jobs to finish would defeat the entire point.
             self._restarting = True
             self.stop()
+        elif kind == protocol.UPGRADE:
+            await self.upgrade(frame)
         elif kind == protocol.DENIED:
             raise _Denied(frame.get("reason") or "no reason given")
+
+    async def upgrade(self, frame: dict) -> None:
+        """Fetch the current release and re-install, then come back.
+
+        ## Why a wrapper and one sudoers line
+
+        The agent runs as `proseth`, which has no sudo and cannot write to
+        /opt - that is deliberate, so a compromised agent cannot rewrite its
+        own code. Upgrading needs root, so there is exactly one thing the
+        service account may run as root: `proseth-worker-selfupdate`, a
+        root-owned wrapper installed by the installer. Nothing else is granted,
+        and the wrapper takes no arguments, so there is no room to smuggle a
+        command through it.
+
+        ## Why it does not wait
+
+        The wrapper hands the real work to a separate transient systemd unit
+        and returns immediately. It has to: the installer restarts
+        proseth-worker when it finishes, and anything running inside this
+        service's own cgroup would be killed at that moment - half way through
+        replacing the agent, which is the worst possible time to stop.
+
+        So the acknowledgement here means "the upgrade has been started", not
+        "the upgrade worked". What proves it worked is the agent reconnecting
+        and reporting its new version, which the Supervisor already displays.
+        """
+        reason = str(frame.get("reason") or "asked by the supervisor")
+        log.info("Upgrade requested (%s)", reason)
+
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "/usr/local/bin/proseth-worker-selfupdate",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            proc.kill()
+            out = b"the upgrade launcher did not return within 60 seconds"
+
+        text = (out or b"").decode("utf-8", "replace").strip()
+        if proc.returncode == 0:
+            log.info("Upgrade started; the service will restart itself")
+            await self.send(protocol.HEARTBEAT, facts=facts.collect(),
+                            upgrading=True)
+        else:
+            # The likely cause is an agent installed before the sudoers rule
+            # existed, so say the thing that fixes it rather than only the
+            # exit code.
+            log.error("Could not start the upgrade (exit %s): %s",
+                      proc.returncode, text or "no output")
+            log.error("If this says 'a password is required', this worker "
+                      "predates one-click upgrade. Run once on the box: "
+                      "sudo proseth-worker-update")
+            await self.send(protocol.HEARTBEAT, facts=facts.collect(),
+                            upgrade_error=(text or
+                                           f"exit {proc.returncode}")[:400])
 
     async def run_job(self, frame: dict) -> None:
         job_id = str(frame.get("job") or "")

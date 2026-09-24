@@ -603,6 +603,57 @@ exec env PROSETH_NONINTERACTIVE=1 /bin/bash "\$DIR/install.sh"
 UPDATE
 chmod 755 /usr/local/bin/proseth-worker-update
 
+# --- one-click upgrade from the Supervisor ---------------------------------
+#
+# The agent runs as an unprivileged account with no sudo, on purpose, and the
+# code it runs lives in root-owned /opt so it cannot rewrite itself. Upgrading
+# needs root. So there is exactly ONE thing the service account may run as
+# root, it takes no arguments, and it is owned by root in a directory the
+# service account cannot write to.
+#
+# The wrapper does not do the work: it hands it to a separate transient systemd
+# unit. It has to, because the installer restarts proseth-worker when it
+# finishes - and anything running inside that service's own cgroup is killed at
+# that moment, half way through replacing the agent.
+cat > /usr/local/bin/proseth-worker-selfupdate <<'SELFUPDATE'
+#!/bin/sh
+# Start an upgrade OUTSIDE this service's cgroup and return at once.
+# Takes no arguments by design: it is the one command the agent may run as
+# root, so there must be nothing to smuggle through it.
+set -e
+if command -v systemd-run >/dev/null 2>&1; then
+  exec systemd-run --collect --quiet \
+    --unit="proseth-worker-selfupdate-$(date +%s)" \
+    /usr/local/bin/proseth-worker-update
+fi
+# No systemd-run: detach far enough that the service restart cannot take the
+# updater down with it.
+setsid nohup /usr/local/bin/proseth-worker-update </dev/null \
+  >/var/log/proseth-worker-update.log 2>&1 &
+exit 0
+SELFUPDATE
+chmod 755 /usr/local/bin/proseth-worker-selfupdate
+chown root:root /usr/local/bin/proseth-worker-selfupdate
+
+# A broken file in /etc/sudoers.d breaks sudo for EVERYONE on the machine, so
+# it is written to a temporary path, checked, and only then put in place - the
+# same reasoning as validating sshd_config before reloading it.
+SUDOERS_TMP="$(mktemp)"
+cat > "$SUDOERS_TMP" <<SUDOERS
+# Installed by the Proseth Worker installer.
+# Exactly one command, no arguments, so the Supervisor can upgrade this agent
+# without the service account being given any other privilege.
+$RUN_USER ALL=(root) NOPASSWD: /usr/local/bin/proseth-worker-selfupdate
+SUDOERS
+if visudo -cf "$SUDOERS_TMP" >/dev/null 2>&1; then
+  install -m 440 -o root -g root "$SUDOERS_TMP" /etc/sudoers.d/proseth-worker
+  ok "one-click upgrade from the Supervisor enabled"
+else
+  warn "could not install the sudoers rule for one-click upgrade"
+  echo "    Upgrades still work on the box: sudo proseth-worker-update"
+fi
+rm -f "$SUDOERS_TMP"
+
 cat > "/etc/systemd/system/$SERVICE.service" <<UNIT
 [Unit]
 Description=Proseth Worker - deploy agent
