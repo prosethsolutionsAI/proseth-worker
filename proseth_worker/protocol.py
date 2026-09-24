@@ -74,6 +74,11 @@ PING = "ping"
 JOB = "job"
 CANCEL = "cancel"
 RELOAD = "reload"
+# Ask the agent to exit so its service manager restarts it. The agent does NOT
+# shell out to `systemctl` for this: the service account has no sudo, on
+# purpose. It exits cleanly and systemd's `Restart=` brings it back - which
+# also means a restart works identically however the agent was started.
+RESTART = "restart"
 DENIED = "denied"
 
 # --- job kinds -------------------------------------------------------------

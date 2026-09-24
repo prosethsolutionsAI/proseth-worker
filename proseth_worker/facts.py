@@ -147,6 +147,36 @@ def uptime_seconds() -> int | None:
         return None
 
 
+def job_slots() -> dict:
+    """How many jobs are running, out of how many can be.
+
+    ## Why the heartbeat has to carry this
+
+    The heartbeat runs on asyncio's default executor; jobs run on a separate
+    four-thread pool. So an agent whose pool is completely wedged goes on
+    answering heartbeats, reporting 0.3% CPU and plenty of memory, and shows
+    up as a healthy green worker - while every job sent to it queues for ever.
+
+    That happened here: three `ssh` jobs with no wall-clock deadline held the
+    pool, and the Supervisor cheerfully dispatched more into a queue nobody
+    was draining. The deadline is fixed, but a health signal that cannot
+    report "I am full" would let the next cause of the same symptom hide just
+    as well.
+    """
+    from .jobs import EXECUTOR  # noqa: PLC0415 - avoids an import cycle
+
+    busy = len([t for t in getattr(EXECUTOR, "_threads", ()) if t.is_alive()])
+    capacity = EXECUTOR._max_workers  # noqa: SLF001 - no public accessor
+    queued = EXECUTOR._work_queue.qsize()  # noqa: SLF001
+    return {
+        # Threads are created lazily, so "alive" counts those ever started -
+        # the queue depth is the honest signal that work is backing up.
+        "job_threads": busy,
+        "job_capacity": capacity,
+        "jobs_queued": queued,
+    }
+
+
 def collect() -> dict:
     """One heartbeat's worth of facts."""
     info = distro()
@@ -169,4 +199,11 @@ def collect() -> dict:
         pass
     facts.update(memory())
     facts.update(disk())
+    try:
+        facts.update(job_slots())
+    except Exception:  # noqa: BLE001
+        # Never let reporting break the heartbeat: a worker that stops
+        # heartbeating looks offline, which is a worse lie than missing a
+        # queue depth.
+        pass
     return facts

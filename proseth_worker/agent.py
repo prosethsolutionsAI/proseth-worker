@@ -80,6 +80,9 @@ class Agent:
         # job id -> cancelled flag, so a handler can notice between steps.
         self.cancelled: set[str] = set()
         self.running: set[str] = set()
+        # Set when the supervisor asked for a restart, so the exit path knows
+        # to come back rather than stay down.
+        self._restarting = False
 
         if not self.host or not self.token:
             log.error("The configuration is missing the supervisor address or "
@@ -206,6 +209,20 @@ class Agent:
                 self.cancelled.add(job_id)
         elif kind == protocol.RELOAD:
             await self.send(protocol.HEARTBEAT, facts=facts.collect())
+        elif kind == protocol.RESTART:
+            # Acknowledged BEFORE exiting, so the supervisor learns the agent
+            # accepted it rather than only that the connection dropped - which
+            # is what a crash looks like too.
+            reason = str(frame.get("reason") or "asked by the supervisor")
+            log.info("Restart requested (%s) - exiting for the service "
+                     "manager to bring us back", reason)
+            await self.send(protocol.HEARTBEAT, facts=facts.collect(),
+                            restarting=True)
+            # Anything still running is abandoned deliberately: a restart is
+            # what an engineer reaches for when a job is stuck, so waiting for
+            # jobs to finish would defeat the entire point.
+            self._restarting = True
+            self.stop()
         elif kind == protocol.DENIED:
             raise _Denied(frame.get("reason") or "no reason given")
 
@@ -338,8 +355,21 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        # `wait=False`: a restart is usually asked for BECAUSE a job is stuck,
+        # so waiting for the pool would hang the very thing meant to unstick
+        # it. systemd's TimeoutStopSec would then SIGKILL us anyway, just
+        # slower and with a scarier journal entry.
         EXECUTOR.shutdown(wait=False)
         loop.close()
+
+    if getattr(agent, "_restarting", False):
+        log.info("proseth-worker exiting for restart")
+        # A non-zero code so `Restart=on-failure` brings us back too, not only
+        # `Restart=always`. os._exit rather than return: threads in the pool
+        # may still be wedged - that is frequently why a restart was asked for
+        # - and a normal interpreter exit would wait for them.
+        os._exit(75)  # EX_TEMPFAIL
+
     log.info("proseth-worker stopped")
     return 0
 

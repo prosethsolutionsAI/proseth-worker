@@ -193,19 +193,39 @@ def run_ssh(payload: dict, emit: Emit, should_stop: ShouldStop) -> dict:
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
 
+    timeout = int(payload.get("timeout") or 3600)
     try:
         chan = client.get_transport().open_session()
-        chan.settimeout(int(payload.get("timeout") or 3600))
+        chan.settimeout(timeout)
         chan.set_combine_stderr(True)
         chan.exec_command("bash -s")
         chan.sendall(script.encode("utf-8"))
         chan.shutdown_write()
 
+        # The deadline is enforced HERE, in the loop, not by `settimeout`.
+        #
+        # `settimeout` only bounds a BLOCKING read. Every call below is a
+        # non-blocking poll - `recv_ready`, `exit_status_ready` - so a command
+        # that neither produces output nor exits spins this loop for ever and
+        # the channel timeout never fires. That is not theoretical: three
+        # wedged `ssh` jobs filled the four-thread executor on the live worker
+        # and every new job queued behind them for ever, while the agent went
+        # on answering heartbeats and reporting itself perfectly healthy.
+        deadline = time.monotonic() + timeout
         buf = b""
         while True:
             if should_stop():
                 chan.close()
                 return {"ok": False, "error": "Cancelled from the supervisor."}
+            if time.monotonic() > deadline:
+                chan.close()
+                return {
+                    "ok": False,
+                    "error": f"No output and no exit after {timeout}s - the "
+                             "command on the target is still running, so it "
+                             "was abandoned. Check it by hand before running "
+                             "this again.",
+                }
             if chan.recv_ready():
                 chunk = chan.recv(8192)
                 if not chunk:
