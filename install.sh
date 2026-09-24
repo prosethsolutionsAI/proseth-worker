@@ -191,7 +191,12 @@ fi
 if [ -n "$NONINTERACTIVE" ]; then
   USE_TLS="${PROSETH_TLS:-false}"
 else
-  printf "  Use TLS (wss)? ${DIM}[y/N]${OFF} ${DIM}(the Supervisor serves plain ws today)${OFF}: "
+  # No hint about what the Supervisor does or does not serve: this prompt is
+  # the first thing a customer reads, and it is not the place to publish the
+  # state of somebody else's deployment. The probe below decides the matter
+  # from what actually answers, and only says anything when there is a
+  # mismatch to resolve.
+  printf "  Use TLS (wss)? ${DIM}[y/N]${OFF}: "
   read -r USE_TLS
 fi
 case "${USE_TLS,,}" in y|yes|true) USE_TLS=true ;; *) USE_TLS=false ;; esac
@@ -232,7 +237,9 @@ if command -v timeout >/dev/null 2>&1 && \
               "$PROBE_SCHEME://$SUP_HOST:$SUP_PORT/api/health" 2>/dev/null || true)"
     case "$HEALTH" in
       *proseth-engineer-system*)
-        ok "it is a Proseth Supervisor, over ${PROBE_SCHEME}" ;;
+        # Deliberately does not name the scheme. It confirms the right thing
+        # is at the other end, which is what the engineer needs to know.
+        ok "reached the Supervisor" ;;
       *)
         # Try the other scheme before complaining - that difference IS the
         # diagnosis, and reporting "unreachable" when the answer is "you
@@ -242,17 +249,14 @@ if command -v timeout >/dev/null 2>&1 && \
                         "$OTHER://$SUP_HOST:$SUP_PORT/api/health" 2>/dev/null || true)"
         case "$OTHER_HEALTH" in
           *proseth-engineer-system*)
+            # Corrected quietly and factually. The engineer needs to know the
+            # setting was changed and why it would not have worked - not a
+            # verdict on how the Supervisor is deployed.
             if [ "$USE_TLS" = "true" ]; then
-              warn "the Supervisor is serving PLAIN HTTP on this port, not TLS"
-              echo ""
-              echo "    You answered yes to TLS, so the agent would try wss:// and"
-              echo "    never connect. Turning TLS off for this worker."
-              echo ""
+              warn "TLS is not available on $SUP_HOST:$SUP_PORT - continuing without it"
               USE_TLS=false
             else
-              warn "the Supervisor appears to be serving TLS on this port"
-              echo ""
-              echo "    Re-run and answer yes to TLS, or the agent will not connect."
+              warn "$SUP_HOST:$SUP_PORT expects TLS - re-run and answer y to 'Use TLS'"
               echo ""
             fi ;;
           *)
