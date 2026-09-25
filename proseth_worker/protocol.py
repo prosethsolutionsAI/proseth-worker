@@ -112,10 +112,15 @@ JOB_NETMIKO = "netmiko"
 # Sweep a CIDR for reachable hosts, so an engineer can add an inventory without
 # typing twenty addresses that only exist inside the customer's network.
 JOB_DISCOVER = "discover"
+# Run a PowerShell script on a Windows host over WinRM. The Supervisor reaches
+# Windows with its own PowerShell remoting; a worker is Linux, so it speaks
+# WinRM itself (pywinrm). Added in agent 1.2.0 - an older agent answers
+# "does not know the job kind".
+JOB_WINRM = "winrm"
 
 JOB_KINDS = (
     JOB_SHELL, JOB_SSH, JOB_PROBE, JOB_ANSIBLE,
-    JOB_TERRAFORM, JOB_NETMIKO, JOB_DISCOVER,
+    JOB_TERRAFORM, JOB_NETMIKO, JOB_DISCOVER, JOB_WINRM,
 )
 
 

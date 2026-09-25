@@ -492,8 +492,10 @@ if [ ! -x "$PREFIX/venv/bin/python" ]; then
   python3 -m venv "$PREFIX/venv" || die "Could not create the Python venv."
 fi
 "$PREFIX/venv/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1
+# pywinrm is how a Linux worker reaches Windows (WinRM, NTLM) - the Supervisor
+# uses its own PowerShell for that, which a worker does not have.
 if ! "$PREFIX/venv/bin/pip" install --quiet \
-     "websockets>=12" "paramiko>=3" "netmiko>=4.3" >/dev/null 2>&1; then
+     "websockets>=12" "paramiko>=3" "netmiko>=4.3" "pywinrm>=0.4.3" >/dev/null 2>&1; then
   die "Could not install the Python dependencies. Check this machine can reach PyPI."
 fi
 ok "agent $AGENT_VERSION and its dependencies"

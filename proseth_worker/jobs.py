@@ -687,6 +687,192 @@ def run_discover(payload: dict, emit: Emit, should_stop: ShouldStop) -> dict:
     return {"ok": True, "found": found, "scanned": len(hosts)}
 
 
+# ------------------------------------------------------------------- winrm
+#
+# Windows behind a worker. The Supervisor reaches Windows with its own
+# PowerShell remoting, which a Linux worker does not have - and before this job
+# existed a Windows host behind a worker was sent down the SSH path, which
+# connected to WinRM's port and reported "Error reading SSH protocol banner".
+#
+# pywinrm is what Ansible uses for the same job. Two decisions worth knowing:
+#
+# **The script travels on STDIN, base64, not on the command line.** A command
+# line has a length limit the hardening script alone exceeds several times
+# over, and base64 is plain ASCII so the shell's code page cannot mangle it.
+# The command itself is a fixed, tiny bootstrap that reads stdin, decodes it
+# and runs it as a script block - the same thing the Supervisor's own runner
+# does with an environment variable.
+#
+# **NTLM with message encryption, over HTTP on 5985 by default.** That works
+# for local and domain accounts with no Kerberos set-up on the worker, and
+# pywinrm encrypts the payload itself - the credential and the script are not
+# in clear on the customer's LAN. 5986 means HTTPS; its certificate is almost
+# always self-signed, so it is not validated, which is the same trust-on-first-
+# use position the SSH jobs take with host keys.
+
+_PS_BOOTSTRAP = (
+    "$ErrorActionPreference='Stop';"
+    "$b=[Console]::In.ReadToEnd();"
+    "$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b.Trim()));"
+    "& ([ScriptBlock]::Create($s))"
+)
+
+
+def _winrm_session(target: dict):
+    """A pywinrm Protocol and the account name it will log in as."""
+    try:
+        from winrm.protocol import Protocol  # noqa: PLC0415
+    except ImportError as exc:
+        raise RuntimeError(
+            "pywinrm is not installed on this worker, so it cannot reach Windows. "
+            "Update the worker (Upgrade on the Workers page, or "
+            "`sudo proseth-worker-update`)."
+        ) from exc
+
+    address = str(target.get("address") or "").strip()
+    if not address:
+        raise ValueError("The job did not say which host to connect to.")
+    if not target.get("password"):
+        raise ValueError("Windows hosts need a password - WinRM has no key login.")
+
+    port = int(target.get("port") or 5985)
+    https = port == 5986 or bool(target.get("https"))
+    user = str(target.get("username") or "")
+    domain = str(target.get("domain") or "")
+    if domain and "\\" not in user and "@" not in user:
+        user = f"{domain}\\{user}"
+
+    endpoint = f"{'https' if https else 'http'}://{address}:{port}/wsman"
+    proto = Protocol(
+        endpoint=endpoint,
+        transport="ntlm",
+        username=user,
+        password=target.get("password"),
+        server_cert_validation="ignore",
+        message_encryption="auto",
+        read_timeout_sec=70,
+        operation_timeout_sec=60,
+    )
+    return proto, user
+
+
+def _clixml_errors(raw: str) -> list[str]:
+    """PowerShell sends errors on stderr as CLIXML. Pull out the readable text."""
+    import re  # noqa: PLC0415
+
+    if "#< CLIXML" not in raw:
+        return [line for line in raw.splitlines() if line.strip()]
+    out = []
+    for m in re.finditer(r'<S S="Error">(.*?)</S>', raw, re.S):
+        text = (m.group(1).replace("_x000D_", "").replace("_x000A_", "\n")
+                .replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+                .replace("&quot;", '"').replace("&apos;", "'"))
+        out.extend(t for t in text.splitlines() if t.strip())
+    return out
+
+
+def _winrm_hint(message: str, target: dict) -> str:
+    low = message.lower()
+    where = target.get("address")
+    if "401" in low or "unauthorized" in low or "credentials were rejected" in low:
+        return (f"{where} refused the login for '{target.get('username')}'. Check "
+                "the password, and the domain if it is a domain account.")
+    if "connection refused" in low or "max retries" in low or "timed out" in low \
+            or "no route" in low:
+        return (f"Could not reach WinRM on {where}:{target.get('port') or 5985} from "
+                "this worker. On the server: `Enable-PSRemoting -Force`, and allow "
+                "TCP 5985 (HTTP) or 5986 (HTTPS) from the worker in its firewall.")
+    if "access is denied" in low or "access denied" in low:
+        return (f"{where} accepted the login but refused the command. The account "
+                "must be a local Administrator or in Remote Management Users.")
+    return f"{where}: {message}"
+
+
+def run_winrm(payload: dict, emit: Emit, should_stop: ShouldStop) -> dict:
+    """Run a PowerShell script on a Windows host, streaming its output."""
+    import base64  # noqa: PLC0415
+
+    target = payload.get("target") or {}
+    script = payload.get("script") or ""
+    if not script.strip():
+        return {"ok": False, "error": "No script was supplied."}
+    timeout = int(payload.get("timeout") or 3600)
+
+    try:
+        proto, _ = _winrm_session(target)
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+    captures: dict[str, str] = {}
+    shell_id = command_id = None
+    try:
+        # 65001 is UTF-8, so a non-English server's output survives the trip.
+        shell_id = proto.open_shell(codepage=65001, noprofile=True)
+        command_id = proto.run_command(
+            shell_id, "powershell.exe",
+            ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-EncodedCommand",
+             base64.b64encode(_PS_BOOTSTRAP.encode("utf-16-le")).decode("ascii")],
+        )
+        body = base64.b64encode(script.encode("utf-8"))
+        chunk = 96 * 1024  # well inside WinRM's default 500 KB envelope
+        for i in range(0, len(body), chunk):
+            proto.send_command_input(shell_id, command_id, body[i:i + chunk],
+                                     end=i + chunk >= len(body))
+
+        # get_command_output_raw in pywinrm 0.5, _raw_get_command_output before.
+        poll = getattr(proto, "get_command_output_raw", None) or \
+            getattr(proto, "_raw_get_command_output")
+        deadline = time.monotonic() + timeout
+        buf, errbuf, code, done = "", "", 0, False
+        while not done:
+            if should_stop():
+                return {"ok": False, "error": "Cancelled from the supervisor."}
+            if time.monotonic() > deadline:
+                return {"ok": False, "error": f"No exit after {timeout}s - abandoned. "
+                        "Check the machine by hand before running this again."}
+            try:
+                out, err, code, done = poll(shell_id, command_id)
+            except Exception as exc:  # noqa: BLE001
+                # An operation timeout means "nothing new yet", not a failure -
+                # WinRM long-polls, and a quiet step is normal.
+                if "OperationTimeout" in type(exc).__name__ or "2150858793" in str(exc):
+                    continue
+                raise
+            buf += out.decode("utf-8", "replace")
+            errbuf += err.decode("utf-8", "replace")
+            *lines, buf = buf.split("\n")
+            for line in lines:
+                line = line.rstrip("\r")
+                if not _harvest(line, captures):
+                    emit("stdout", line)
+        for line in buf.splitlines():
+            if line.strip() and not _harvest(line, captures):
+                emit("stdout", line)
+        errors = _clixml_errors(errbuf)
+        for line in errors[:40]:
+            emit("stdout", f"!! {line}")
+        ok = code == 0
+        return {
+            "ok": ok,
+            "exit_code": code,
+            "captures": captures,
+            "error": "" if ok else (
+                _exit_hint(code) if not errors else
+                f"{errors[0][:300]} (exit {code})"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": _winrm_hint(f"{type(exc).__name__}: {exc}", target)}
+    finally:
+        try:
+            if shell_id and command_id:
+                proto.cleanup_command(shell_id, command_id)
+            if shell_id:
+                proto.close_shell(shell_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 HANDLERS = {
     "shell": run_shell,
     "ssh": run_ssh,
@@ -695,4 +881,5 @@ HANDLERS = {
     "terraform": run_terraform,
     "netmiko": run_netmiko,
     "discover": run_discover,
+    "winrm": run_winrm,
 }
