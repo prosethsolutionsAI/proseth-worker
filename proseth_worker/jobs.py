@@ -564,7 +564,11 @@ def run_netmiko(payload: dict, emit: Emit, should_stop: ShouldStop) -> dict:
     # and a preflight that connected differently from the apply would not be
     # proving anything about the apply.
     mode = str(payload.get("mode") or "config")
-    if mode not in ("config", "show"):
+    # `commit` (1.2.1): Junos and PAN-OS keep changes in a candidate
+    # configuration until committed. A commit can run for minutes, so it is
+    # Netmiko's commit() - which waits for the vendor's completion marker and
+    # raises without it - not a line inside a config set.
+    if mode not in ("config", "show", "commit"):
         return {"ok": False, "error": f"Unknown netmiko mode '{mode}'."}
     if not commands:
         return {"ok": False, "error": "No commands were supplied."}
@@ -601,6 +605,24 @@ def run_netmiko(payload: dict, emit: Emit, should_stop: ShouldStop) -> dict:
                     for line in (text or "").splitlines():
                         emit("stdout", line)
                 return {"ok": True, "output": "\n".join(chunks), "prompt": prompt}
+
+            if mode == "commit":
+                words = " ".join(commands).split()
+                kwargs: dict = {}
+                if words[:1] == ["confirmed"]:
+                    kwargs["confirm"] = True
+                    if len(words) > 1 and words[1].isdigit():
+                        kwargs["confirm_delay"] = int(words[1])
+                emit("stdout", "Committing" + (f" ({' '.join(words)})" if words else ""))
+                try:
+                    output = conn.commit(read_timeout=900, **kwargs)
+                except ValueError as exc:
+                    return {"ok": False, "error": f"The commit was refused: {exc}"[:2000]}
+                for line in (output or "").splitlines():
+                    emit("stdout", line)
+                if conn.check_config_mode():
+                    conn.exit_config_mode()
+                return {"ok": True, "output": output, "prompt": prompt}
 
             output = conn.send_config_set(
                 commands, cmd_verify=False, read_timeout=120)
