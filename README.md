@@ -21,6 +21,11 @@ it open. Jobs arrive down that connection; output streams back up it. There is
 no listening port, no inbound firewall rule to open, no VPN, and no need for a
 static address at your end.
 
+The one exception is **opt-in**: if you turn on [monitoring alerts](#monitoring-alerts-optional),
+the worker listens on one port (9997) for *your own* monitoring server, on your
+own network, so it can pass alerts to the Supervisor. It is off unless you
+answer yes during install.
+
 **It only does what it is told, by one Supervisor.**
 
 The agent is given a token at install time. That token is what ties this
@@ -83,6 +88,7 @@ The installer asks four things:
 | The port | Defaults to 9998. |
 | Whether to use TLS | `wss://` instead of `ws://`. **Answer yes only if TLS has been terminated in front of your Supervisor.** The installer checks the port and corrects the setting if the answer does not match what is there. Asked every time rather than remembered, so a wrong answer cannot persist. |
 | The worker name and token | Issued when the worker was created in the platform. The name should match what you called it there. |
+| Whether to accept monitoring alerts | Optional, default no. See [Monitoring alerts](#monitoring-alerts-optional). Unattended: `PROSETH_ALERTS=1`. |
 
 It then checks it can actually reach the Supervisor **before** changing
 anything, installs Python, Ansible, Terraform, kubectl and helm, creates an
@@ -155,6 +161,9 @@ with no internet at all.
 
 | Version | What changed |
 |---|---|
+| 1.3.0 | **Monitoring alerts (opt-in).** A listener on port 9997 that Zabbix, Wazuh, Prometheus Alertmanager or any webhook can post to. Alerts are queued on disk and relayed to the Supervisor over the existing connection, and deleted only once the Supervisor confirms it stored them. Off unless enabled at install; kept on unattended re-runs. `proseth-worker --alert-secret` prints the token. |
+| 1.2.1 | A Junos / PAN-OS change is committed with the vendor's own commit, waiting for it to finish, instead of a line in the config set. |
+| 1.2.0 | Windows hosts reached from the worker over WinRM (pywinrm, NTLM), with the script sent on stdin. |
 | 1.1.6 | `proseth-worker --check` is clean and truthful: no `RuntimeWarning` from a double import, and an unreadable config now says it needs sudo to read rather than claiming the worker is not set up. It also shows whether TLS is in use. |
 | 1.1.5 | `proseth-worker --check` works from any directory. The launcher did not set `PYTHONPATH` — only the systemd unit did — so the service ran fine while the command the installer prints and this file documents failed with `No module named 'proseth_worker'` for anyone not standing in `/opt`. |
 | 1.1.4 | **One-click upgrade from the Supervisor.** A worker showing an available update can be upgraded from its card rather than by finding a shell on it. The agent is granted exactly one command through sudo — a root-owned wrapper taking no arguments — which starts the ordinary installer in a separate systemd unit so restarting the service cannot kill the update half way through. The worker still fetches the release itself; nothing is pushed to it. |
@@ -180,12 +189,130 @@ sudo systemctl restart proseth-worker  # after changing the configuration
 | `/etc/proseth-worker/config.json` | Supervisor address, port, TLS, worker name, token. Mode `640`, readable by root and the `proseth` service account only. |
 | `/etc/proseth-worker/supervisor.crt` | The Supervisor's certificate, when TLS is in use — this is what the agent verifies against. Public; mode `644`. |
 | `/var/lib/proseth-worker` | Everything the agent writes: Ansible temp, Terraform working directories, SSH known hosts. This is also the service account's `$HOME` — Ansible refuses to start without a writable one. |
+| `/var/lib/proseth-worker/alerts` | Monitoring alerts waiting for the Supervisor to confirm them, one file each (mode `600`). Empty in normal running. |
 
 | Command | What it does |
 |---|---|
 | `proseth-worker --check` | Version, hostname, distro, CPU, memory, disk. Touches nothing. |
 | `sudo proseth-worker-update` | Fetch and install the current agent, keeping the configuration. |
-| `sudo proseth-worker-setup` | Re-run the wizard to change the address or token. |
+| `sudo proseth-worker-setup` | Re-run the wizard to change the address or token, or turn alerts on/off. |
+| `sudo proseth-worker --alert-secret` | Print the token monitoring tools send with an alert. |
+
+---
+
+## Monitoring alerts (optional)
+
+When this is on, your monitoring server tells the worker something is wrong,
+and the worker passes it to the Supervisor — which opens a ticket for your
+engineers. The Supervisor still never connects into your network.
+
+* The listener is `http://<this worker>:9997/alert/<source>`, where `<source>`
+  is `zabbix`, `alertmanager`, `wazuh` or `generic`.
+* Every request must carry `Authorization: Bearer <token>`. The token is shown
+  once at install, and any time with `sudo proseth-worker --alert-secret`.
+* **Allow port 9997 only from your monitoring server.** If ufw is active the
+  installer offers to add exactly that rule.
+* `GET /health` answers `{"ok": true}` with no token, so you can test that the
+  port is reachable before configuring anything.
+* An alert is written to disk before your tool gets its `202`, and removed only
+  once the Supervisor confirms it stored it. A link outage loses nothing; at
+  most the newest 1000 are kept.
+
+The examples use documentation addresses — replace `203.0.113.20` with your
+worker's address and `TOKEN` with the token.
+
+### Zabbix
+
+*Alerts → Media types → Create*, type **Webhook**, with these parameters:
+
+| Name | Value |
+|---|---|
+| `url` | `http://203.0.113.20:9997/alert/zabbix` |
+| `token` | `TOKEN` |
+| `event_id` | `{EVENT.ID}` |
+| `event_value` | `{EVENT.VALUE}` |
+| `host` | `{HOST.HOST}` |
+| `host_ip` | `{HOST.IP}` |
+| `trigger_name` | `{EVENT.NAME}` |
+| `severity` | `{EVENT.SEVERITY}` |
+| `message` | `{ALERT.MESSAGE}` |
+
+Script:
+
+```javascript
+var p = JSON.parse(value);
+var req = new HttpRequest();
+req.addHeader('Content-Type: application/json');
+req.addHeader('Authorization: Bearer ' + p.token);
+req.post(p.url, JSON.stringify({
+  event_id: p.event_id, event_value: p.event_value, host: p.host,
+  host_ip: p.host_ip, trigger_name: p.trigger_name, severity: p.severity,
+  message: p.message
+}));
+if (req.getStatus() != 202) { throw 'Proseth worker answered ' + req.getStatus(); }
+return 'OK';
+```
+
+Then add the media type to a user and an action, with **recovery operations**
+on, so a resolved problem is reported too (`event_value` 0).
+
+### Prometheus Alertmanager
+
+```yaml
+receivers:
+  - name: proseth
+    webhook_configs:
+      - url: http://203.0.113.20:9997/alert/alertmanager
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            credentials: TOKEN
+```
+
+### Wazuh
+
+In `/var/ossec/etc/ossec.conf` on the manager:
+
+```xml
+<integration>
+  <name>custom-proseth</name>
+  <hook_url>http://203.0.113.20:9997/alert/wazuh</hook_url>
+  <api_key>TOKEN</api_key>
+  <level>10</level>
+  <alert_format>json</alert_format>
+</integration>
+```
+
+and `/var/ossec/integrations/custom-proseth` (`chown root:wazuh`, `chmod 750`):
+
+```python
+#!/var/ossec/framework/python/bin/python3
+import sys, urllib.request
+alert_file, token, url = sys.argv[1], sys.argv[2], sys.argv[3]
+body = open(alert_file, "rb").read()
+req = urllib.request.Request(url, data=body, method="POST", headers={
+    "Content-Type": "application/json", "Authorization": "Bearer " + token})
+urllib.request.urlopen(req, timeout=10)
+```
+
+Restart the manager: `systemctl restart wazuh-manager`.
+
+### Anything else
+
+```bash
+curl -X POST http://203.0.113.20:9997/alert/generic \
+  -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
+  -d '{"host":"web-01","title":"Disk / is 95% full","severity":"high",
+       "alertname":"DiskFull","status":"firing"}'
+```
+
+`status` may be `firing` or `resolved`; `severity` is `info`, `warning`, `high`
+or `critical`. A list of such objects is several alerts.
+
+The host name in an alert should be the name, address or hostname of a machine
+registered behind this worker on the Supervisor. One that matches nothing is
+held for an engineer to assign — it is never guessed.
 
 ---
 
@@ -218,6 +345,7 @@ install.sh                    the installer and its wizard
 proseth_worker/agent.py       the connection, reconnect and job loop; VERSION lives here
 proseth_worker/jobs.py        the job handlers
 proseth_worker/facts.py       CPU, memory, disk — read from /proc, no psutil
+proseth_worker/alerts.py      the optional alert listener and its on-disk queue
 proseth_worker/protocol.py    the wire format
 ```
 

@@ -102,6 +102,7 @@ MEM_GB=$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || 
 
 EXISTING_HOST=""; EXISTING_PORT=""; EXISTING_NAME=""; EXISTING_TOKEN=""
 EXISTING_TLS=""
+EXISTING_ALERT_SECRET=""; EXISTING_ALERT_PORT=""
 if [ -f "$CONFIG" ]; then
   EXISTING_HOST=$(python3 -c "import json;print(json.load(open('$CONFIG')).get('supervisor_host',''))" 2>/dev/null || echo "")
   EXISTING_PORT=$(python3 -c "import json;print(json.load(open('$CONFIG')).get('supervisor_port',''))" 2>/dev/null || echo "")
@@ -112,6 +113,10 @@ if [ -f "$CONFIG" ]; then
   # again on any worker that had it on. Every other value was preserved, which
   # made it the kind of thing nobody would think to check.
   EXISTING_TLS=$(python3 -c "import json;print('true' if json.load(open('$CONFIG')).get('tls') else 'false')" 2>/dev/null || echo "")
+  # Read back for the same reason as TLS: an unattended re-run must not quietly
+  # turn alert intake off on a worker a customer's Zabbix is posting to.
+  EXISTING_ALERT_SECRET=$(python3 -c "import json;print(json.load(open('$CONFIG')).get('alert_secret',''))" 2>/dev/null || echo "")
+  EXISTING_ALERT_PORT=$(python3 -c "import json;print(json.load(open('$CONFIG')).get('alert_port',''))" 2>/dev/null || echo "")
   say "Found an existing configuration — press Enter to keep each value."
   echo ""
 fi
@@ -211,6 +216,41 @@ ask "Token (psw_...)" "$EXISTING_TOKEN" WORKER_TOKEN secret
 case "$WORKER_TOKEN" in
   psw_*) : ;;
   *) die "That does not look like a Proseth token — they start with 'psw_'." ;;
+esac
+
+# --- alert intake (optional) -----------------------------------------------
+# The one exception to "nothing connects to this machine": with this on, the
+# customer's own monitoring server (Zabbix, Wazuh, Alertmanager) posts alerts
+# to a listener here, on THIS network, and the agent relays them out to the
+# Supervisor. Off unless asked for. An existing answer is KEPT, including on an
+# unattended re-run, for the same reason TLS has to be read back.
+echo ""
+say "${BOLD}Alerts${OFF}"
+echo "${DIM}    Optional. Lets monitoring tools on this network send alerts to the${OFF}"
+echo "${DIM}    Supervisor through this worker. Opens one port on this machine.${OFF}"
+ALERT_SECRET="$EXISTING_ALERT_SECRET"
+ALERT_PORT="${EXISTING_ALERT_PORT:-9997}"
+if [ -n "$NONINTERACTIVE" ]; then
+  case "${PROSETH_ALERTS:-}" in
+    1|y|yes|true) WANT_ALERTS=y ;;
+    0|n|no|false) WANT_ALERTS=n ;;
+    *) if [ -n "$ALERT_SECRET" ]; then WANT_ALERTS=y; else WANT_ALERTS=n; fi ;;
+  esac
+else
+  DEF="N"; [ -n "$ALERT_SECRET" ] && DEF="Y"
+  printf "  Accept alerts from monitoring tools? ${DIM}[%s]${OFF}: " "$DEF"
+  read -r WANT_ALERTS
+  WANT_ALERTS="${WANT_ALERTS:-$DEF}"
+fi
+case "${WANT_ALERTS,,}" in
+  y|yes)
+    ask "Alert port" "$ALERT_PORT" ALERT_PORT
+    case "$ALERT_PORT" in (''|*[!0-9]*) die "'$ALERT_PORT' is not a port number." ;; esac
+    if [ -z "$ALERT_SECRET" ]; then
+      ALERT_SECRET="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+      NEW_ALERT_SECRET=1
+    fi ;;
+  *) ALERT_SECRET="" ;;
 esac
 
 # --- prove it can get there BEFORE installing anything ---------------------
@@ -540,6 +580,12 @@ if [ "$USE_TLS" = "true" ]; then
   fi
 fi
 
+ALERT_LINE=""
+if [ -n "$ALERT_SECRET" ]; then
+  ALERT_LINE="  \"alert_port\": $ALERT_PORT,
+  \"alert_secret\": \"$ALERT_SECRET\","
+fi
+
 cat > "$CONFIG" <<JSON
 {
   "worker_name": "$WORKER_NAME",
@@ -548,6 +594,7 @@ cat > "$CONFIG" <<JSON
   "tls": $USE_TLS,
   "verify_tls": true,
 $CA_LINE
+$ALERT_LINE
   "token": "$WORKER_TOKEN"
 }
 JSON
@@ -556,6 +603,36 @@ JSON
 chown root:"$RUN_USER" "$CONFIG"
 chmod 640 "$CONFIG"
 ok "configuration written to $CONFIG"
+
+if [ -n "$ALERT_SECRET" ]; then
+  ok "alerts accepted on port $ALERT_PORT"
+  # Only the monitoring server should reach this port. If ufw is managing the
+  # firewall, offer to open it for exactly that address - never for anyone.
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if [ -z "$NONINTERACTIVE" ]; then
+      printf "  Allow port %s through ufw from (monitoring server IP, blank = skip): " "$ALERT_PORT"
+      read -r MON_IP
+      if [ -n "$MON_IP" ]; then
+        if ufw allow from "$MON_IP" to any port "$ALERT_PORT" proto tcp >/dev/null 2>&1; then
+          ok "ufw: $MON_IP may reach port $ALERT_PORT"
+        else
+          warn "ufw refused that rule - add it by hand"
+        fi
+      fi
+    else
+      warn "ufw is active - allow port $ALERT_PORT from the monitoring server by hand"
+    fi
+  fi
+  if [ -n "${NEW_ALERT_SECRET:-}" ]; then
+    echo ""
+    echo "    Monitoring tools must send this token with every alert"
+    echo "    (header  Authorization: Bearer <token>):"
+    echo ""
+    echo "      $ALERT_SECRET"
+    echo ""
+    echo "${DIM}    Shown again any time with: sudo proseth-worker --alert-secret${OFF}"
+  fi
+fi
 
 # --- launcher and service --------------------------------------------------
 # PYTHONPATH is set HERE as well as in the systemd unit.

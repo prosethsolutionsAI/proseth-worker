@@ -28,6 +28,7 @@ Worker -> Supervisor                  Supervisor -> Worker
   pong       latency reply             job        do this
   output     a line of job output      cancel     stop that job
   result     job finished              reload     re-send your facts
+  alert      a monitoring alert        alert_ack  that alert is stored
 
 ## Two rules worth keeping
 
@@ -67,6 +68,12 @@ HEARTBEAT = "heartbeat"
 PONG = "pong"
 OUTPUT = "output"
 RESULT = "result"
+# A monitoring tool on the customer's network (Zabbix, Wazuh, Alertmanager...)
+# posted an alert to the agent's local listener. The agent relays the RAW body
+# with the source name; the supervisor does all the parsing, so supporting a new
+# tool never needs a worker upgrade. Added in agent 1.3.0. An older supervisor
+# ignores the frame, and the agent keeps the alert queued until acknowledged.
+ALERT = "alert"
 
 # supervisor -> worker
 WELCOME = "welcome"
@@ -90,6 +97,15 @@ RESTART = "restart"
 # through by killing the process that started it.
 UPGRADE = "upgrade"
 DENIED = "denied"
+# The supervisor has STORED alert <id>; the agent may delete its queued copy.
+# Sent after the write, never before, so a supervisor crash between receiving
+# and storing loses nothing - the agent sends it again on the next connection.
+ALERT_ACK = "alert_ack"
+
+# The port the agent's alert listener binds to on the customer network, when
+# alert intake is turned on. Separate from everything else so it can be
+# firewalled to the monitoring server alone.
+DEFAULT_ALERT_PORT = 9997
 
 # --- job kinds -------------------------------------------------------------
 #

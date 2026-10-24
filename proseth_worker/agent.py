@@ -13,6 +13,11 @@ supervisor needs no route into the customer's network and no VPN; and two
 customers may use the same address space without colliding, because an address
 is only ever resolved here.
 
+The one exception is opt-in: with alert intake turned on, the customer's own
+monitoring server posts alerts to a listener on THIS network (`alerts.py`).
+That is a LAN connection inside the customer's site, never one from the
+Supervisor, and it is off unless an alert secret is configured.
+
 ## Reconnecting
 
 The connection WILL drop - a link flaps, the supervisor restarts, a firewall
@@ -36,7 +41,7 @@ import signal
 import sys
 from pathlib import Path
 
-from . import facts, protocol
+from . import alerts, facts, protocol
 from .jobs import EXECUTOR, HANDLERS
 
 # The agent's version, and the ONE place it is written down. The installer
@@ -46,10 +51,13 @@ from .jobs import EXECUTOR, HANDLERS
 #
 # Bump it whenever the agent or the installer changes in a way an existing
 # worker should pick up. `sudo proseth-worker-update` is how a worker gets it.
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 
 CONFIG_PATH = Path(os.environ.get("PROSETH_WORKER_CONFIG",
                                   "/etc/proseth-worker/config.json"))
+# Writable by the service account (the installer creates it 0700). Queued
+# alerts live under it so they survive an agent restart.
+STATE_DIR = Path(os.environ.get("PROSETH_WORKER_STATE", "/var/lib/proseth-worker"))
 
 log = logging.getLogger("proseth-worker")
 
@@ -122,6 +130,16 @@ class Agent:
         # to come back rather than stay down.
         self._restarting = False
 
+        # Alert intake is OFF unless a secret is configured: it is the one
+        # thing on this machine that accepts a connection, so it must be asked
+        # for, never on by default.
+        self.alert_secret = str(config.get("alert_secret") or "").strip()
+        self.alert_port = int(config.get("alert_port")
+                              or protocol.DEFAULT_ALERT_PORT)
+        self.alert_bind = str(config.get("alert_bind") or "0.0.0.0")
+        self.alert_queue: alerts.AlertQueue | None = None
+        self._alert_wake: asyncio.Event | None = None
+
         if not self.host or not self.token:
             log.error("The configuration is missing the supervisor address or "
                       "the token. Run: sudo proseth-worker-setup")
@@ -134,7 +152,64 @@ class Agent:
 
     # -- the loop -----------------------------------------------------------
 
+    def start_alerts(self) -> None:
+        """Start the alert listener, if configured. Never fatal.
+
+        A port already in use or an unwritable queue directory is logged and
+        the agent carries on without intake: losing alert relay must not also
+        take away deploys, which are what the worker is mostly for.
+        """
+        if not self.alert_secret:
+            return
+        loop = asyncio.get_running_loop()
+        self._alert_wake = asyncio.Event()
+
+        def wake() -> None:  # called on a listener thread
+            try:
+                loop.call_soon_threadsafe(self._alert_wake.set)
+            except RuntimeError:
+                pass
+
+        try:
+            self.alert_queue = alerts.AlertQueue(STATE_DIR / "alerts")
+            alerts.AlertListener(self.alert_port, self.alert_secret,
+                                 self.alert_queue, wake,
+                                 bind=self.alert_bind).start()
+        except OSError as exc:
+            log.error("Alert intake could not start on %s:%s (%s) - this "
+                      "worker will not relay alerts until that is fixed",
+                      self.alert_bind, self.alert_port, exc)
+            self.alert_queue = None
+            return
+        log.info("Accepting alerts on %s:%s (%s queued)", self.alert_bind,
+                 self.alert_port, self.alert_queue.depth())
+
+    async def relay_alerts(self) -> None:
+        """Send queued alerts up this connection until it closes."""
+        queue = self.alert_queue
+        if queue is None or self._alert_wake is None:
+            return
+        queue.reset_sent()
+        while True:
+            for record in queue.due():
+                if not await self.send(protocol.ALERT, id=record["id"],
+                                       source=record.get("source", ""),
+                                       payload=record.get("payload", ""),
+                                       remote=record.get("remote", ""),
+                                       received_at=record.get("received_at")):
+                    return
+                queue.mark_sent(record["id"])
+            self._alert_wake.clear()
+            try:
+                # Woken at once by a new alert; otherwise look again in a while
+                # for anything sent and never acknowledged.
+                await asyncio.wait_for(self._alert_wake.wait(),
+                                       timeout=alerts.RESEND_AFTER)
+            except asyncio.TimeoutError:
+                pass
+
     async def run(self) -> None:
+        self.start_alerts()
         backoff = BACKOFF_START
         while not self.stopping.is_set():
             try:
@@ -232,11 +307,13 @@ class Agent:
                      frame.get("name") or self.name, frame.get("worker_id"))
             interval = int(frame.get("heartbeat") or protocol.HEARTBEAT_SECONDS)
             beat = asyncio.create_task(self.heartbeat(interval))
+            relay = asyncio.create_task(self.relay_alerts())
             try:
                 async for raw in socket:
                     await self.handle(protocol.parse(raw))
             finally:
                 beat.cancel()
+                relay.cancel()
                 self.websocket = None
 
     async def heartbeat(self, interval: int) -> None:
@@ -290,6 +367,9 @@ class Agent:
             self.stop()
         elif kind == protocol.UPGRADE:
             await self.upgrade(frame)
+        elif kind == protocol.ALERT_ACK:
+            if self.alert_queue is not None:
+                self.alert_queue.ack(str(frame.get("id") or ""))
         elif kind == protocol.DENIED:
             raise _Denied(frame.get("reason") or "no reason given")
 
@@ -432,6 +512,9 @@ def main() -> int:
     parser.add_argument("--config", help="Path to config.json")
     parser.add_argument("--check", action="store_true",
                         help="Show what this worker is and exit.")
+    parser.add_argument("--alert-secret", action="store_true",
+                        help="Print the token monitoring tools must send "
+                             "with an alert, and exit.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -463,7 +546,22 @@ def main() -> int:
                   f"{config.get('supervisor_port')}"
                   + ("  (TLS)" if config.get("tls") else ""))
             print(f"  token   : {'set' if config.get('token') else 'MISSING'}")
+            if config.get("alert_secret"):
+                print(f"  alerts  : accepted on {config.get('alert_bind') or '0.0.0.0'}:"
+                      f"{config.get('alert_port') or protocol.DEFAULT_ALERT_PORT}"
+                      "  (sudo proseth-worker --alert-secret shows the token)")
+            else:
+                print("  alerts  : off")
         return 0
+
+    if args.alert_secret:
+        config, problem = read_config()
+        if config is None:
+            print(problem)
+            return 1
+        secret = config.get("alert_secret") or ""
+        print(secret or "Alert intake is off. Turn it on: sudo proseth-worker-setup")
+        return 0 if secret else 1
 
     agent = Agent(load_config())
     loop = asyncio.new_event_loop()
